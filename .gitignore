@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.tsbuildinfo
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/hs_err_pid*.log
+.idea/
+*.iml
+*.log
+.DS_Store
+要求约束/
