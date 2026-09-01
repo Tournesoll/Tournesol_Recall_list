@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   aiImportSchema,
-  backupSchema,
   backupSchemaV1,
   backupSchemaV2,
   normalizeJsonInput,
 } from "./schemas";
+import { QUESTION_EXPLANATION_LABEL } from "./domain";
 import {
   applyReview,
   db,
@@ -51,6 +51,75 @@ const shuffle = <T,>(a: T[]) => {
   }
   return x;
 };
+const NOTE_DISPLAY_KEY = "recall-lite-note-display-v1";
+const readNoteDisplay = (): "always" | "after-answer" =>
+  localStorage.getItem(NOTE_DISPLAY_KEY) === "always" ? "always" : "after-answer";
+const itemLabel = (item: MemoryItem) => item.question || item.content || item.answer || "未命名内容";
+const itemTxt = (item: MemoryItem) => {
+  const lines = [
+    `[${typeLabel[item.type]}] ${itemLabel(item)}`,
+    item.type === "recall" && item.answer ? `答案：${item.answer}` : "",
+    item.type === "choice" && item.options ? `选项：${item.options.join(" / ")}` : "",
+    item.type === "choice" && item.correctIndex !== undefined ? `正确答案：${item.options?.[item.correctIndex] || ""}` : "",
+    item.type === "cloze" && item.content ? `内容：${item.content}` : "",
+    item.explanation ? `${QUESTION_EXPLANATION_LABEL}：${item.explanation}` : "",
+    item.note ? `笔记：${item.note}` : "",
+  ];
+  return lines.filter(Boolean).join("\n");
+};
+const downloadText = (filename: string, content: string) => {
+  const href = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = href; a.download = filename; a.click();
+  window.setTimeout(() => URL.revokeObjectURL(href), 1000);
+};
+const openText = (filename: string, content: string) => {
+  const href = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
+  const opened = window.open(href, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    // Popup blockers can reject window.open; navigating the current tab is still usable on mobile.
+    window.location.href = href;
+  } else {
+    window.setTimeout(() => URL.revokeObjectURL(href), 60000);
+  }
+  return filename;
+};
+const copyText = async (content: string) => {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(content);
+      return true;
+    }
+  } catch {
+    // Fall through to the textarea method used by older/mobile WebViews.
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = content;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch { copied = false; }
+  textarea.remove();
+  return copied;
+};
+const shareText = async (title: string, filename: string, content: string) => {
+  try {
+    if (navigator.share && typeof File !== "undefined") {
+      await navigator.share({ title, files: [new File([content], filename, { type: "text/plain" })] });
+      return "已打开系统分享";
+    }
+  } catch (error: any) {
+    if (error?.name === "AbortError") return "";
+  }
+  downloadText(filename, content);
+  return "当前设备不支持直接分享，已下载 TXT 文件";
+};
 
 function Icon({ children }: { children: string }) {
   return (
@@ -91,6 +160,30 @@ function Button({
       {children}
     </button>
   );
+}
+function TextPreviewModal({
+  title,
+  filename,
+  content,
+  onClose,
+}: {
+  title: string;
+  filename: string;
+  content: string;
+  onClose: () => void;
+}) {
+  const [message, setMessage] = useState("");
+  const copy = async () => setMessage((await copyText(content)) ? "已复制，可粘贴到微信、备忘录或 AI 工具" : "复制失败，请长按文本选择复制");
+  return <div className="modal-backdrop" onClick={onClose}><div className="modal text-preview-modal" onClick={(event) => event.stopPropagation()}>
+    <div className="section-head modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose}>×</button></div>
+    <textarea className="text-preview" value={content} readOnly onFocus={(event) => event.currentTarget.select()} />
+    <div className="text-preview-actions">
+      <Button secondary onClick={() => void copy()}>复制文本</Button>
+      <Button secondary onClick={() => openText(filename, content)}>打开文本</Button>
+      <Button onClick={() => downloadText(filename, content)}>下载 TXT</Button>
+    </div>
+    {message && <div className="success-box">{message}</div>}
+  </div></div>;
 }
 function Empty({ title, action }: { title: string; action?: React.ReactNode }) {
   return (
@@ -147,6 +240,8 @@ function Nav() {
     loc = useLocation();
   const active = loc.pathname.startsWith("/libraries")
     ? "libraries"
+    : loc.pathname.startsWith("/mistakes")
+      ? "mistakes"
     : loc.pathname.startsWith("/records")
       ? "records"
       : "home";
@@ -173,6 +268,9 @@ function Nav() {
         <Icon>▤</Icon>
         <span>记录</span>
       </button>
+      <button className={active === "mistakes" ? "active" : ""} onClick={() => nav("/mistakes")}>
+        <Icon>★</Icon><span>错题本</span>
+      </button>
     </nav>
   );
 }
@@ -185,88 +283,6 @@ function Layout({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Home({ libs, items }: { libs: Library[]; items: MemoryItem[] }) {
-  const nav = useNavigate();
-  const due = items.filter((x) => x.nextReviewAt <= Date.now()).length;
-  const recentLibs = libs
-    .slice()
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .slice(0, 4);
-  const recent = items
-    .slice()
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 3);
-  return (
-    <Layout>
-      <div className="home-head">
-        <div>
-          <div className="date-display">{fmtDate(Date.now())}</div>
-          <div className="subtitle">今天想背什么？</div>
-        </div>
-        <button
-          className="icon-button"
-          onClick={() => nav("/settings")}
-          aria-label="设置"
-        >
-          <Icon>⚙</Icon>
-        </button>
-      </div>
-      <Button onClick={() => nav("/study/setup")}>
-        开始背诵 <span>→</span>
-      </Button>
-      <Button secondary onClick={() => nav("/add")}>
-        ＋ 添加内容
-      </Button>
-      <section>
-        <div className="section-head">
-          <h2>最近知识库</h2>
-          <button onClick={() => nav("/libraries")}>查看全部 ›</button>
-        </div>
-        {recentLibs.length ? (
-          <div className="library-grid">
-            {recentLibs.map((l) => (
-              <LibraryCard
-                key={l.id}
-                lib={l}
-                items={items.filter((i) => i.libraryId === l.id)}
-                onClick={() => nav(`/libraries/${l.id}`)}
-              />
-            ))}
-          </div>
-        ) : (
-          <Empty
-            title="还没有知识库"
-            action={
-              <Button onClick={() => nav("/libraries")}>新建知识库</Button>
-            }
-          />
-        )}
-      </section>
-      <section>
-        <div className="section-head">
-          <h2>最近添加</h2>
-          <button onClick={() => nav("/records")}>查看全部 ›</button>
-        </div>
-        {recent.length ? (
-          <div className="recent-list">
-            {recent.map((i) => (
-              <RecentRow
-                key={i.id}
-                item={i}
-                lib={libs.find((l) => l.id === i.libraryId)}
-              />
-            ))}
-          </div>
-        ) : (
-          <Empty title="还没有添加内容" />
-        )}
-      </section>
-      <div className="home-footnote">
-        当前有 <b>{due}</b> 条内容待复习
-      </div>
-    </Layout>
-  );
-}
 function LibraryCard({
   lib,
   items,
@@ -311,228 +327,6 @@ function RecentRow({ item, lib }: { item: MemoryItem; lib?: Library }) {
   );
 }
 
-function Libraries({
-  libs,
-  items,
-  onRefresh,
-}: {
-  libs: Library[];
-  items: MemoryItem[];
-  onRefresh: () => void;
-}) {
-  const nav = useNavigate();
-  const create = async () => {
-    const name = window.prompt("知识库名称");
-    if (!name?.trim()) return;
-    const now = Date.now();
-    await db.libraries.add({
-      id: id("lib"),
-      name: name.trim(),
-      createdAt: now,
-      updatedAt: now,
-    });
-    onRefresh();
-  };
-  const remove = async (l: Library) => {
-    if (!window.confirm(`删除“${l.name}”及其全部内容？`)) return;
-    await db.transaction("rw", db.libraries, db.items, async () => {
-      await db.items.where("libraryId").equals(l.id).delete();
-      await db.libraries.delete(l.id);
-    });
-    onRefresh();
-  };
-  return (
-    <Layout>
-      <div className="page-top">
-        <h1>知识库</h1>
-        <button className="text-button" onClick={create}>
-          ＋ 新建
-        </button>
-      </div>
-      {libs.length ? (
-        <div className="stack">
-          {libs
-            .slice()
-            .sort((a, b) => b.updatedAt - a.updatedAt)
-            .map((l) => (
-              <div className="library-list-row" key={l.id}>
-                <button
-                  className="row-main"
-                  onClick={() => nav(`/libraries/${l.id}`)}
-                >
-                  <div className="glyph-box">▤</div>
-                  <div>
-                    <strong>{l.name}</strong>
-                    <span>
-                      {items.filter((i) => i.libraryId === l.id).length} 条 ·{" "}
-                      {
-                        items.filter(
-                          (i) =>
-                            i.libraryId === l.id &&
-                            i.nextReviewAt <= Date.now(),
-                        ).length
-                      }{" "}
-                      条待复习
-                    </span>
-                  </div>
-                  <Icon>›</Icon>
-                </button>
-                <button className="delete-link" onClick={() => remove(l)}>
-                  删除
-                </button>
-              </div>
-            ))}
-        </div>
-      ) : (
-        <Empty
-          title="还没有知识库"
-          action={<Button onClick={create}>＋ 新建知识库</Button>}
-        />
-      )}
-      <Button onClick={create}>＋ 新建知识库</Button>
-    </Layout>
-  );
-}
-
-function LibraryDetail({
-  lib,
-  items,
-  onRefresh,
-}: {
-  lib: Library;
-  items: MemoryItem[];
-  onRefresh: () => void;
-}) {
-  const nav = useNavigate();
-  const [sort, setSort] = useState<"default" | "new">("default");
-  const libraryItems = items.filter((i) => i.libraryId === lib.id);
-  const list = libraryItems
-    .slice()
-    .sort((a, b) =>
-      sort === "new" ? b.createdAt - a.createdAt : a.createdAt - b.createdAt,
-    );
-  const remove = async (item: MemoryItem) => {
-    if (!window.confirm("删除这条内容？")) return;
-    await db.items.delete(item.id);
-    onRefresh();
-  };
-  return (
-    <Layout>
-      <Back title={lib.name} />
-      <div className="stats">
-        <span>▤ {libraryItems.length} 条</span>
-        <span>
-          ◷ {libraryItems.filter((i) => i.nextReviewAt <= Date.now()).length}{" "}
-          条待复习
-        </span>
-      </div>
-      <Button onClick={() => nav(`/study/setup?library=${lib.id}`)}>
-        开始背诵
-      </Button>
-      <Button secondary onClick={() => nav(`/add/manual?library=${lib.id}`)}>
-        ＋ 添加
-      </Button>
-      <div className="section-head detail-head">
-        <h2>全部内容</h2>
-        <select
-          value={sort}
-          onChange={(e) => setSort(e.target.value as "default" | "new")}
-        >
-          <option value="default">默认排序</option>
-          <option value="new">最近添加</option>
-        </select>
-      </div>
-      {list.length ? (
-        <div className="item-list">
-          {list.map((item, idx) => (
-            <div className="item-row" key={item.id}>
-              <span className="item-number">{idx + 1}</span>
-              <div className="glyph-box small">{typeGlyph[item.type]}</div>
-              <div className="item-preview">
-                <small>{typeLabel[item.type]}</small>
-                <strong>{item.question || item.content || ""}</strong>
-              </div>
-              <button
-                className="edit-link"
-                onClick={() => nav(`/add/manual?edit=${item.id}`)}
-              >
-                ✎
-              </button>
-              <button
-                className="icon-button"
-                onClick={() => remove(item)}
-                aria-label="删除"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <Empty
-          title="这个知识库还没有内容"
-          action={
-            <Button onClick={() => nav(`/add/manual?library=${lib.id}`)}>
-              添加第一条
-            </Button>
-          }
-        />
-      )}
-    </Layout>
-  );
-}
-
-function AddPage() {
-  const nav = useNavigate();
-  return (
-    <Layout>
-      <Back title="添加内容" />
-      <p className="lead">选择一种方式，开始添加背诵内容</p>
-      <div className="choice-menu">
-        <button onClick={() => nav("/add/manual")}>
-          <div className="glyph-box">✎</div>
-          <div>
-            <strong>手动添加</strong>
-            <span>自己输入一条背诵内容</span>
-          </div>
-          <Icon>›</Icon>
-        </button>
-        <button onClick={() => nav("/add/ai")}>
-          <div className="glyph-box">✦</div>
-          <div>
-            <strong>AI 整理导入</strong>
-            <span>复制提示词，去外部 AI 整理后再粘贴</span>
-          </div>
-          <Icon>›</Icon>
-        </button>
-      </div>
-      <div className="info-note">ⓘ 支持正反背诵、遮挡背诵、选择题</div>
-    </Layout>
-  );
-}
-
-function LibraryPicker({
-  libs,
-  value,
-  onChange,
-}: {
-  libs: Library[];
-  value: string;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="field">
-      <span>导入到知识库</span>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
-        {libs.map((l) => (
-          <option key={l.id} value={l.id}>
-            {l.name}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
 function ImageInput({
   value,
   onChange,
@@ -636,6 +430,9 @@ function ManualPage({
   const [options, setOptions] = useState(editing?.options || ["", ""]);
   const [correctIndex, setCorrectIndex] = useState(editing?.correctIndex || 0);
   const [image, setImage] = useState(editing?.imageDataUrl);
+  const [note, setNote] = useState(editing?.note || "");
+  const [noteDisplay, setNoteDisplay] = useState<"always" | "after-answer">(editing?.noteDisplay === "always" ? "always" : editing?.noteDisplay === "after-answer" ? "after-answer" : readNoteDisplay());
+  const [explanation, setExplanation] = useState(editing?.explanation || "");
   const [error, setError] = useState("");
   const save = async () => {
     setError("");
@@ -671,6 +468,10 @@ function ManualPage({
       options: undefined,
       correctIndex: undefined,
       imageDataUrl: image || undefined,
+      note: note.trim() || undefined,
+      noteDisplay,
+      explanation: explanation.trim() || undefined,
+      explanationType: explanation.trim() ? QUESTION_EXPLANATION_LABEL : undefined,
     };
     if (type === "recall") {
       data.question = question.trim();
@@ -793,6 +594,21 @@ function ManualPage({
             )}
           </>
         )}
+        <label className="field">
+          <span>笔记（可选）</span>
+          <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="记录易错点、联想或记忆方法" />
+        </label>
+        <label className="field">
+          <span>笔记展示</span>
+          <select value={noteDisplay} onChange={(e) => setNoteDisplay(e.target.value as "always" | "after-answer")}>
+            <option value="after-answer">出答案后展示</option>
+            <option value="always">题目下常驻展示</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>题目解析（可选）</span>
+          <textarea value={explanation} onChange={(e) => setExplanation(e.target.value)} placeholder="补充解题思路、知识背景或易错点" />
+        </label>
         <ImageInput value={image} onChange={setImage} />
       </div>
       {error && <div className="error-text">{error}</div>}
@@ -900,14 +716,15 @@ const promptTypeMeta: Record<PromptCardType, { label: string; description: strin
     schema: '{"type":"choice","question":"中华人民共和国成立于哪一年？","options":["1945年","1949年","1950年"],"correctIndex":1}',
   },
 };
-const buildAiPrompt = (types: PromptCardType[]) => {
+const buildAiPrompt = (types: PromptCardType[], includeExplanation = false) => {
   const chosen = types.length ? types : (["recall"] as PromptCardType[]);
   const typeRules = chosen.map((type, index) => {
     const meta = promptTypeMeta[type];
     return `【卡片类型 ${index + 1}：${meta.label}（${type}）】\n${meta.description}\n字段示例：${meta.schema}`;
   }).join("\n\n");
   const allowed = chosen.join("、");
-  return `你是“学习资料转背诵卡片”的整理工具。请只根据我最后提供的原始资料生成卡片。\n\n【本次允许的卡片类型】\n只允许使用：${allowed}。不要生成未被允许的类型。\n\n【通用规则】\n1. 不遗漏原资料中的核心事实、年份、人物、概念、定义、公式和关键表达，不凭空补充。\n2. 一条卡片只考一个清晰知识点，答案要能独立核对。\n3. 根据原资料自然拆分，不要为了凑数量重复改写。\n4. 最多输出 1000 条；没有足够内容时少生成，不要编造。\n\n${typeRules}\n\n【固定输出格式】\n只输出一个可直接 JSON.parse 的 JSON 对象，不要 Markdown 代码块、标题、解释或其他文字：\n{"version":1,"items":[]}\n\n【输出前自检】\n- 顶层必须是 version=1 且包含 items 数组。\n- 每条 item 只能使用已允许的 type。\n- recall 必须有非空 question 和 answer。\n- cloze 的 content 至少包含一组非空 {{答案}}。\n- choice 的 correctIndex 必须是 0 到 options.length-1 的整数，且答案确实来自原资料。\n- 所有字符串使用合法 JSON 双引号，不能有尾逗号。\n\n【原始学习资料】\n`;
+  const explanationRule = includeExplanation ? `\n【题目解析要求】\n请为每条卡片增加 explanation 字段。解析应结合具体学科和题型，说明关键知识、推理依据或易错点；必须以原始资料为依据，没有依据时留空，不要编造。` : "";
+  return `你是“学习资料转背诵卡片”的整理工具。请只根据我最后提供的原始资料生成卡片。\n\n【本次允许的卡片类型】\n只允许使用：${allowed}。不要生成未被允许的类型。\n\n【通用规则】\n1. 不遗漏原资料中的核心事实、年份、人物、概念、定义、公式和关键表达，不凭空补充。\n2. 一条卡片只考一个清晰知识点，答案要能独立核对。\n3. 根据原资料自然拆分，不要为了凑数量重复改写。\n4. 最多输出 1000 条；没有足够内容时少生成，不要编造。\n${explanationRule}\n\n${typeRules}\n\n【固定输出格式】\n只输出一个可直接 JSON.parse 的 JSON 对象，不要 Markdown 代码块、标题、解释或其他文字：\n{"version":1,"items":[]}\n\n【输出前自检】\n- 顶层必须是 version=1 且包含 items 数组。\n- 每条 item 只能使用已允许的 type。\n- recall 必须有非空 question 和 answer。\n- cloze 的 content 必须至少包含一组非空、成对的 {{答案}}，不要使用单花括号或空的 {{}}。\n- choice 的 correctIndex 必须是 0 到 options.length-1 的整数，且答案确实来自原资料。\n- 所有字符串使用合法 JSON 双引号，不能有尾逗号。\n\n【原始学习资料】\n`;
 };
 function AiPage({
   libs,
@@ -925,10 +742,12 @@ function AiPage({
     "cloze",
     "choice",
   ]);
+  const [includeExplanation, setIncludeExplanation] = useState(false);
   const [text, setText] = useState("");
   const [error, setError] = useState("");
   const [parsed, setParsed] = useState<any>();
-  const prompt = useMemo(() => buildAiPrompt(selectedTypes), [selectedTypes]);
+  const [copyMessage, setCopyMessage] = useState("");
+  const prompt = useMemo(() => buildAiPrompt(selectedTypes, includeExplanation), [selectedTypes, includeExplanation]);
   const togglePromptType = (type: PromptCardType) => {
     setSelectedTypes((current) => {
       if (current.includes(type)) {
@@ -957,11 +776,14 @@ function AiPage({
       libraryId,
       batchId,
       ...x,
+      explanationType: x.explanation ? QUESTION_EXPLANATION_LABEL : undefined,
       createdAt: now,
       updatedAt: now,
       reviewLevel: 0,
       nextReviewAt: now,
       retentionFactor: 0.6,
+      reviewCount: 0,
+      againCount: 0,
     }));
     await db.items.bulkAdd(rows);
     await db.libraries.update(libraryId, { updatedAt: now });
@@ -1005,6 +827,14 @@ function AiPage({
           ))}
         </div>
       </div>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={includeExplanation}
+          onChange={(event) => setIncludeExplanation(event.target.checked)}
+        />
+        <span>生成题目解析</span>
+      </label>
       <div className="prompt-box">
         <pre
           style={{
@@ -1020,10 +850,11 @@ function AiPage({
         </pre>
         <button
           className="text-button"
-          onClick={() => navigator.clipboard?.writeText(prompt)}
+          onClick={async () => setCopyMessage((await copyText(prompt)) ? "提示词已复制" : "复制失败，请长按上方文本选择复制")}
         >
           复制完整提示词
         </button>
+        {copyMessage && <div className="success-box">{copyMessage}</div>}
       </div>
       <GroupLibraryPicker groups={groups} libs={libs} value={libraryId} onChange={setLibraryId} onRefresh={onRefresh} />
       <label className="field">
@@ -1418,6 +1249,8 @@ function Settings({
   onRefresh: () => void;
 }) {
   const [message, setMessage] = useState("");
+  const [preview, setPreview] = useState<{ title: string; filename: string; content: string } | null>(null);
+  const [noteDisplay, setNoteDisplay] = useState<"always" | "after-answer">(readNoteDisplay());
   const exportData = async () => {
     const payload = {
       schemaVersion: 2,
@@ -1438,6 +1271,17 @@ function Settings({
     a.click();
     URL.revokeObjectURL(a.href);
     setMessage("V2 备份已导出");
+  };
+  const exportTxt = () => {
+    const grouped = libs.map((lib) => {
+      const rows = items.filter((item) => item.libraryId === lib.id);
+      return `# ${lib.name}\n\n${rows.map(itemTxt).join("\n\n")}`;
+    }).join("\n\n");
+    downloadText(`recall-lite-${dateKey(Date.now())}.txt`, grouped || "暂无内容");
+    setMessage("TXT 文档已下载");
+  };
+  const updateNoteDisplay = (value: "always" | "after-answer") => {
+    setNoteDisplay(value); localStorage.setItem(NOTE_DISPLAY_KEY, value);
   };
   const importData = async (file?: File) => {
     if (!file) return;
@@ -1487,6 +1331,10 @@ function Settings({
       setMessage(e?.issues?.[0]?.message || e.message || "备份文件无效");
     }
   };
+  const txtContent = libs.map((lib) => {
+    const rows = items.filter((item) => item.libraryId === lib.id);
+    return `# ${lib.name}\n\n${rows.map(itemTxt).join("\n\n")}`;
+  }).join("\n\n") || "暂无内容";
   const clear = async () => {
     if (!window.confirm("确定清空全部数据？此操作不可撤销。")) return;
     await db.transaction(
@@ -1512,6 +1360,9 @@ function Settings({
       <Back title="设置" />
       <h2>数据</h2>
       <div className="settings-list">
+        <button onClick={() => setPreview({ title: "导出备份 TXT", filename: `recall-lite-${dateKey(Date.now())}.txt`, content: txtContent })}>
+          <div className="glyph-box">TXT</div><div><strong>导出 TXT 文档</strong><span>把全部知识库导出为可阅读的文本</span></div><Icon>›</Icon>
+        </button>
         <button onClick={exportData}>
           <div className="glyph-box">↑</div>
           <div>
@@ -1533,6 +1384,10 @@ function Settings({
             onChange={(e) => importData(e.target.files?.[0])}
           />
         </label>
+      </div>
+      <h2>背诵显示</h2>
+      <div className="settings-list">
+        <label><div className="glyph-box">注</div><div><strong>笔记展示方式</strong><span>控制背诵时笔记出现的时机</span></div><select value={noteDisplay} onChange={(e) => updateNoteDisplay(e.target.value as "always" | "after-answer")}><option value="after-answer">出答案后</option><option value="always">常驻</option></select></label>
       </div>
       <h2>关于</h2>
       <div className="settings-list">
@@ -1562,6 +1417,7 @@ function Settings({
       <button className="danger-button" onClick={clear}>
         清空全部数据
       </button>
+      {preview && <TextPreviewModal {...preview} onClose={() => setPreview(null)} />}
     </Layout>
   );
 }
@@ -2196,6 +2052,7 @@ function LibraryDetailV2({
 }) {
   const nav = useNavigate();
   const [showDetails, setShowDetails] = useState(false);
+  const [showMoreActions, setShowMoreActions] = useState(false);
   const libraryItems = items.filter((i) => i.libraryId === lib.id);
   const group = groups.find((g) => g.id === lib.groupId);
   const retention = libraryItems.length
@@ -2217,10 +2074,16 @@ function LibraryDetailV2({
         </span>
         <span>◒ {retention}% 掌握度</span>
       </div>
-      <div className="detail-actions">
+      <div className={`detail-actions ${showMoreActions ? "more-actions-open" : ""}`}>
+        <button className="detail-toggle more-actions-toggle" aria-expanded={showMoreActions} onClick={() => setShowMoreActions((value) => !value)}>
+          更多操作 <span>{showMoreActions ? "⌃" : "⌄"}</span>
+        </button>
         <Button onClick={() => nav(`/study/setup?library=${lib.id}`)}>
           ▷ 开始背诵
         </Button>
+        <button className="detail-secondary" onClick={() => downloadText(`${lib.name}.txt`, libraryItems.map(itemTxt).join("\n\n"))}>↓ 导出 TXT 文档</button>
+        <button className="detail-secondary" onClick={async () => { const result = await shareText(lib.name, `${lib.name}.txt`, libraryItems.map(itemTxt).join("\n\n")); if (result) window.alert(result); }}>↗ 分享知识库</button>
+        <button className="detail-secondary" onClick={() => openText(`${lib.name}.txt`, libraryItems.map(itemTxt).join("\n\n"))}>↗ 在浏览器打开 TXT</button>
         <button
           className="detail-toggle"
           aria-expanded={showDetails}
@@ -2355,11 +2218,14 @@ async function importParsedItems(libraryId: string, parsed: any) {
     libraryId,
     batchId,
     ...x,
+    explanationType: x.explanation ? QUESTION_EXPLANATION_LABEL : undefined,
     createdAt: now,
     updatedAt: now,
     reviewLevel: 0,
     nextReviewAt: now,
     retentionFactor: 0.6,
+    reviewCount: 0,
+    againCount: 0,
   }));
   await db.items.bulkAdd(rows);
   await db.libraries.update(libraryId, { updatedAt: now });
@@ -2485,7 +2351,9 @@ function StudySetupV2({
           ? scopedCandidates.filter((i) => i.nextReviewAt <= Date.now()).map((i) => i.id)
       : range === "today"
         ? scopedCandidates.filter((i) => isToday(i.createdAt)).map((i) => i.id)
-        : range === "manual"
+      : range === "favorites"
+        ? scopedCandidates.filter((i) => i.favorite).map((i) => i.id)
+      : range === "manual"
           ? manualSelected
           : scopedCandidates.map((i) => i.id);
   const toggle = (libraryId: string) =>
@@ -2642,6 +2510,13 @@ function StudySetupV2({
           <span className="muted">先选分类和知识库，再决定本轮取哪些内容</span>
         </div>
       </div>
+      <button
+        className={range === "favorites" ? "range-card active" : "range-card"}
+        onClick={() => setRange("favorites")}
+      >
+        <strong>错题本</strong>
+        <span>收藏的内容</span>
+      </button>
       <div className="selection-summary">
         已选 {selected.length} 个知识库 · 当前筛选 {scopedCandidates.length} 条内容
       </div>
@@ -2778,6 +2653,7 @@ type SessionState = {
   worstRating: ReviewRating;
   reinforcementCount: number;
 };
+type StudyUndo = { item: MemoryItem; log: ReviewLog };
 function StudyQueueV2({
   items,
   onRefresh,
@@ -2795,7 +2671,10 @@ function StudyQueueV2({
   const [completed, setCompleted] = useState<ReviewLog[]>(resumed?.completed || []);
   const [revealed, setRevealed] = useState(resumed?.revealed || false);
   const [selected, setSelected] = useState<number | undefined>(resumed?.selected);
+  const [lastAction, setLastAction] = useState<StudyUndo | null>(null);
+  const [favorite, setFavorite] = useState(false);
   const current = items.find((i) => i.id === queue[0]);
+  useEffect(() => { setFavorite(current?.favorite === true); }, [current?.id, current?.favorite]);
   const total = new Set(initial).size;
   const saveResume = (nextQueue = queue, nextSession = session, nextCompleted = completed, nextRevealed = revealed, nextSelected = selected) => {
     if (!initial.length || nextCompleted.length >= total) return;
@@ -2849,7 +2728,10 @@ function StudyQueueV2({
     };
     const nextSession = { ...session, [current.id]: nextState };
     setSession(nextSession);
+    const countedItem: MemoryItem = { ...current, reviewCount: (current.reviewCount || 0) + 1, againCount: (current.againCount || 0) + (rating === "good" ? 0 : 1) };
     if (rating !== "good") {
+      await db.items.put(countedItem);
+      onRefresh();
       const nextQueue = [...queue.slice(1), current.id];
       setQueue(nextQueue);
       setRevealed(false);
@@ -2868,9 +2750,10 @@ function StudyQueueV2({
       reinforcementCount: nextState.reinforcementCount,
     };
     await db.transaction("rw", db.items, db.reviewLogs, async () => {
-      await db.items.put(applyReview(current, nextState.worstRating, now));
+      await db.items.put(applyReview(countedItem, nextState.worstRating, now));
       await db.reviewLogs.add(log);
     });
+    setLastAction({ item: current, log });
     onRefresh();
     const logs = [...completed, log];
     setCompleted(logs);
@@ -2880,6 +2763,24 @@ function StudyQueueV2({
     setSelected(undefined);
     if (queue.length <= 1) finish(logs);
     else saveResume(nextQueue, nextSession, logs, false, undefined);
+  };
+  const undoPrevious = async () => {
+    if (!lastAction) return;
+    await db.transaction("rw", db.items, db.reviewLogs, async () => {
+      await db.items.put(lastAction.item);
+      await db.reviewLogs.delete(lastAction.log.id);
+    });
+    setQueue((currentQueue) => [lastAction.log.itemId, ...currentQueue]);
+    setCompleted((logs) => logs.filter((log) => log.id !== lastAction.log.id));
+    setLastAction(null);
+    setRevealed(false); setSelected(undefined); setFavorite(lastAction.item.favorite === true);
+    onRefresh();
+  };
+  const toggleFavorite = async () => {
+    if (!current) return;
+    const next = !favorite;
+    await db.items.update(current.id, { favorite: next });
+    setFavorite(next); onRefresh();
   };
   if (!initial.length || !current)
     return (
@@ -2911,6 +2812,11 @@ function StudyQueueV2({
           style={{ width: `${(completed.length / Math.max(total, 1)) * 100}%` }}
         />
       </div>
+      <div className="study-tools">
+        <button className="text-button" onClick={() => void undoPrevious()} disabled={!lastAction}>↶ 上一个</button>
+        <button className={`text-button ${favorite ? "active-tool" : ""}`} onClick={() => void toggleFavorite()}>{favorite ? "★ 已收藏" : "☆ 收藏"}</button>
+        <span className="study-count">已背 {current.reviewCount || 0} 次 · 没背会 {current.againCount || 0} 次</span>
+      </div>
       <div className="study-library">{typeLabel[current.type]}</div>
       <div
         className="study-card"
@@ -2931,6 +2837,8 @@ function StudyQueueV2({
             <RichText text={current.answer || ""} />
           </div>
         )}
+        {current.explanation && revealed && <div className="study-explanation"><b>{QUESTION_EXPLANATION_LABEL}</b><span>{current.explanation}</span></div>}
+        {current.note && (current.noteDisplay === "always" || revealed || readNoteDisplay() === "always") && <div className="study-note"><b>笔记</b><span>{current.note}</span></div>}
         {current.type === "choice" && (
           <div className="study-options">
             {(current.options || []).map((o, i) => (
@@ -3039,6 +2947,13 @@ function StudyCompleteV2({ onRefresh }: { onRefresh: () => void }) {
       </div>
     </Layout>
   );
+}
+
+function Mistakes({ libs, items }: { libs: Library[]; items: MemoryItem[] }) {
+  const nav = useNavigate();
+  const favorites = items.filter((item) => item.favorite);
+  const grouped = libs.map((lib) => ({ lib, rows: favorites.filter((item) => item.libraryId === lib.id) })).filter((entry) => entry.rows.length);
+  return <Layout><Back title="错题本" /><p className="record-note">收藏的内容会自动按知识库归纳，复习时可直接取消收藏。</p>{grouped.length ? grouped.map(({ lib, rows }) => <section className="mistake-group" key={lib.id}><div className="section-head"><h2>{lib.name}</h2><span>{rows.length} 条</span></div>{rows.map((item) => <div className="mistake-row" key={item.id}><div><small>{typeLabel[item.type]} · 没背会 {item.againCount || 0} 次</small><strong>{itemLabel(item)}</strong></div><button className="edit-link" onClick={() => nav(`/add/manual?edit=${item.id}`)}>编辑</button><button className="text-button" onClick={async () => { await db.items.update(item.id, { favorite: false }); window.location.reload(); }}>移除</button></div>)}</section>) : <Empty title="还没有收藏内容" />}</Layout>;
 }
 
 function RecordsV2({
@@ -3324,46 +3239,6 @@ function RecordsV2({
   );
 }
 
-function LegacyApp() {
-  const [libs, setLibs] = useState<Library[]>([]);
-  const [items, setItems] = useState<MemoryItem[]>([]);
-  const [ready, setReady] = useState(false);
-  const loc = useLocation();
-  const refresh = async () => {
-    setLibs(await db.libraries.toArray());
-    setItems(await db.items.toArray());
-  };
-  useEffect(() => {
-    refresh().then(() => setReady(true));
-  }, []);
-  if (!ready) return <div className="loading">正在加载 Recall Lite…</div>;
-  const path = loc.pathname;
-  let page: React.ReactNode;
-  if (path === "/") page = <Home libs={libs} items={items} />;
-  else if (path === "/libraries")
-    page = <Libraries libs={libs} items={items} onRefresh={refresh} />;
-  else if (path.startsWith("/libraries/")) {
-    const lib = libs.find((l) => l.id === path.split("/")[2]);
-    page = lib ? (
-      <LibraryDetail lib={lib} items={items} onRefresh={refresh} />
-    ) : (
-      <Empty title="知识库不存在" />
-    );
-  } else if (path === "/add") page = <AddPage />;
-  else if (path === "/add/manual")
-    page = <ManualPage libs={libs} items={items} onRefresh={refresh} />;
-  else if (path === "/add/ai")
-    page = <AiPage libs={libs} onRefresh={refresh} />;
-  else if (path === "/study/setup") page = <Setup libs={libs} items={items} />;
-  else if (path === "/study")
-    page = <Study items={items} onRefresh={refresh} />;
-  else if (path === "/records") page = <Records items={items} libs={libs} />;
-  else if (path === "/settings")
-    page = <Settings libs={libs} items={items} onRefresh={refresh} />;
-  else page = <Home libs={libs} items={items} />;
-  return page;
-}
-
 export default function App() {
   const [groups, setGroups] = useState<LibraryGroup[]>([]);
   const [libs, setLibs] = useState<Library[]>([]);
@@ -3447,6 +3322,7 @@ export default function App() {
         checkins={checkins}
       />
     );
+  else if (path === "/mistakes") page = <Mistakes libs={libs} items={items} />;
   else if (path === "/settings")
     page = <Settings libs={libs} items={items} onRefresh={refresh} />;
   else

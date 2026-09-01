@@ -1,19 +1,27 @@
 import Dexie, { type EntityTable } from 'dexie';
+import type {
+  DailyCheckin,
+  Library,
+  LibraryGroup,
+  MemoryItem,
+  ReviewLog,
+  ReviewRating,
+} from './domain';
 
-export type MemoryType = 'recall' | 'cloze' | 'choice';
-export type ReviewRating = 'again' | 'hard' | 'good';
-
-export interface LibraryGroup { id: string; parentId?: string; name: string; createdAt: number; updatedAt: number; }
-export interface Library { id: string; groupId?: string; name: string; createdAt: number; updatedAt: number; }
-export interface MemoryItem {
-  id: string; libraryId: string; batchId: string; type: MemoryType;
-  question?: string; answer?: string; content?: string; options?: string[]; correctIndex?: number; imageDataUrl?: string;
-  createdAt: number; updatedAt: number; reviewLevel: number; nextReviewAt: number; lastReviewedAt?: number;
-  /** Per-item retention target used by the long-term forgetting curve. */
-  retentionFactor?: number;
-}
-export interface ReviewLog { id: string; itemId: string; libraryId: string; reviewedAt: number; result: ReviewRating; attempts: number; reinforcementCount: number; }
-export interface DailyCheckin { dateKey: string; checkedAt: number; reviewedCount: number; goodCount: number; hardCount: number; againCount: number; reinforcementCount: number; }
+export type {
+  ContentDisplayMode,
+  DailyCheckin,
+  Library,
+  LibraryGroup,
+  MemoryItem,
+  MemoryType,
+  ReviewLog,
+  ReviewRating,
+  StudySessionState,
+  StudyTask,
+  StudyTaskSelection,
+  StudyTaskStatus,
+} from './domain';
 
 export class RecallDatabase extends Dexie {
   libraryGroups!: EntityTable<LibraryGroup, 'id'>;
@@ -27,6 +35,7 @@ export class RecallDatabase extends Dexie {
     this.version(2).stores({ libraryGroups: 'id,name,createdAt,updatedAt', libraries: 'id,groupId,name,createdAt,updatedAt', items: 'id,libraryId,batchId,type,createdAt,updatedAt,reviewLevel,nextReviewAt,[libraryId+nextReviewAt],[libraryId+createdAt]', reviewLogs: 'id,itemId,libraryId,reviewedAt,result,[libraryId+reviewedAt]', dailyCheckins: 'dateKey,checkedAt' });
     this.version(3).stores({ libraryGroups: 'id,name,createdAt,updatedAt', libraries: 'id,groupId,name,createdAt,updatedAt', items: 'id,libraryId,batchId,type,createdAt,updatedAt,reviewLevel,nextReviewAt,[libraryId+nextReviewAt],[libraryId+createdAt]', reviewLogs: 'id,itemId,libraryId,reviewedAt,result,[libraryId+reviewedAt]', dailyCheckins: 'dateKey,checkedAt' });
     this.version(4).stores({ libraryGroups: 'id,parentId,name,createdAt,updatedAt', libraries: 'id,groupId,name,createdAt,updatedAt', items: 'id,libraryId,batchId,type,createdAt,updatedAt,reviewLevel,nextReviewAt,[libraryId+nextReviewAt],[libraryId+createdAt]', reviewLogs: 'id,itemId,libraryId,reviewedAt,result,[libraryId+reviewedAt]', dailyCheckins: 'dateKey,checkedAt' });
+    this.version(5).stores({ libraryGroups: 'id,parentId,name,createdAt,updatedAt', libraries: 'id,groupId,name,createdAt,updatedAt', items: 'id,libraryId,batchId,type,createdAt,updatedAt,reviewLevel,nextReviewAt,[libraryId+nextReviewAt],[libraryId+createdAt]', reviewLogs: 'id,itemId,libraryId,reviewedAt,result,[libraryId+reviewedAt]', dailyCheckins: 'dateKey,checkedAt' });
   }
 }
 export const db = new RecallDatabase();
@@ -51,6 +60,7 @@ export function applyReview(item: MemoryItem, rating: ReviewRating, now = Date.n
   return { ...item, reviewLevel: next, retentionFactor, lastReviewedAt: now, nextReviewAt: now + REVIEW_INTERVAL_DAYS[next] * 86400000, updatedAt: now };
 }
 
+// Optional development seed. The production App does not call this automatically.
 let seedPromise: Promise<void> | undefined;
 export function seedIfEmpty() {
   if (seedPromise) return seedPromise;
